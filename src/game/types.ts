@@ -115,12 +115,21 @@ export type TileChar =
   | '.' // open floor
   | 'W' // exterior window (dangerous if flashlight points near!)
   | 'G' // broken glass / noisy debris
-  | 'L' // locked door (needs lockpick / spare_keys)
+  | 'P' // Soviet machinery / server rack / desk cover (blocks vision & movement)
+  | 'D' // electrical switchboard (disables cameras/sensors temporarily)
+  | 'K' // in-level master key pickup (fast-opens locked doors on this raid)
+  | 'L' // locked door (needs lockpick / spare_keys / K)
   | 'C' // chained gate (needs boltcutter)
-  | 'V' // vent / technical hatch (shortcut via wrench / разводник)
+  | 'V' // vent / technical hatch (shortcut via wrench / разводник, levels 2+)
   | 'S' // player spawn
   | 'E' // extraction exit
   | 'T'; // target Soviet device
+
+export interface RoomLabelSpec {
+  label: string;
+  x: number; // tile x
+  y: number; // tile y
+}
 
 export interface FacilityDef {
   id: string;
@@ -134,6 +143,7 @@ export interface FacilityDef {
   extractionTimeSec: number;
   timeLimitSec: number;
   mapRows: string[];
+  rooms: RoomLabelSpec[];
   guards: GuardSpec[];
   expectedHaulRange: string;
 }

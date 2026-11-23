@@ -12,6 +12,7 @@ import {
   consumeBeer,
   generatePcbBoards,
   isPointInVisionCone,
+  validateFacilityLayout,
 } from './rules';
 import { PlayerSaveState } from './types';
 
@@ -105,11 +106,12 @@ test('shining flashlight at exterior window triggers запал alert and red fi
   assert.ok(filtered.alertPerSec < raw.alertPerSec * 0.45);
 });
 
-test('vision cone respects wall occlusion and angle bounds', () => {
+test('vision cone respects wall and machinery (P) cover occlusion', () => {
   const grid = [
     '######',
     '#....#',
     '#.##.#',
+    '#..P.#',
     '#....#',
     '######',
   ];
@@ -120,11 +122,31 @@ test('vision cone respects wall occlusion and angle bounds', () => {
     isPointInVisionCone(1.5, 1.5, 0, 4, 0.5, 4.2, 1.5, grid, opened),
     true
   );
-  // Wall in row 2 blocks sight from (2.5, 1.5) to (2.5, 3.5)
+  // Wall in row 2 blocks sight from (2.5, 1.5) to (2.5, 4.5)
   assert.equal(
-    isPointInVisionCone(2.5, 1.5, Math.PI / 2, 4, 0.5, 2.5, 3.5, grid, opened),
+    isPointInVisionCone(2.5, 1.5, Math.PI / 2, 4, 0.5, 2.5, 4.5, grid, opened),
     false
   );
+  // Machinery cover P at (3,3) blocks sight horizontally across row 3
+  assert.equal(
+    isPointInVisionCone(1.5, 3.5, 0, 4, 0.5, 4.5, 3.5, grid, opened),
+    false
+  );
+});
+
+test('all 4 facilities have large valid multi-room layouts, no softlocks, and Level 1 has no locked V hatch', () => {
+  for (const fac of FACILITIES) {
+    const errors = validateFacilityLayout(fac);
+    assert.deepEqual(errors, [], `Layout errors in ${fac.id}: ${errors.join('; ')}`);
+    assert.ok(fac.mapRows[0].length >= 26, `${fac.id} should be >= 26 tiles wide`);
+    assert.ok(fac.mapRows.length >= 16, `${fac.id} should be >= 16 tiles tall`);
+  }
+
+  // Level 1 specifically must NOT have wrench-only V hatches and must have >= 3 hazards (2 guards + camera)
+  const lvl1 = FACILITIES[0];
+  const hasV = lvl1.mapRows.some((r) => r.includes('V'));
+  assert.equal(hasV, false, 'Level 1 must not contain wrench-only V hatches');
+  assert.ok(lvl1.guards.length >= 3, 'Level 1 must have multi-zone guard coverage');
 });
 
 test('PCB generator creates valid boards with precious Soviet parts and payout applies crew share', () => {

@@ -45,6 +45,9 @@ const MiniBlueprintPreview: React.FC<{ facility: FacilityDef }> = ({ facility })
             let fill = '#171d1a';
             if (ch === '#') fill = '#323d37';
             else if (ch === 'W') fill = '#38bdf8';
+            else if (ch === 'P') fill = '#526059';
+            else if (ch === 'D') fill = '#0ea5e9';
+            else if (ch === 'K') fill = '#facc15';
             else if (ch === 'G') fill = '#64748b';
             else if (ch === 'L') fill = '#eab308';
             else if (ch === 'C') fill = '#f97316';
@@ -300,17 +303,20 @@ export const BaseHub: React.FC<BaseHubProps> = ({
                       {selectedFacility.expectedHaulRange}
                     </div>
                     <div className="text-xs text-[#9ca59e] font-mono-num">
-                      Вес {selectedDevice.weightKg} кг · Лимит {selectedFacility.timeLimitSec} с
+                      {selectedFacility.rooms.length} комнат · Охрана: {selectedFacility.guards.length} · {selectedFacility.timeLimitSec} с
                     </div>
                   </div>
                 </div>
 
                 {/* Blueprint legend */}
-                <div className="mt-4 pt-3 border-t border-[#252d28] text-xs font-mono text-[#9ca59e] flex flex-wrap gap-x-4 gap-y-1">
-                  <span><strong className="text-[#38bdf8]">■</strong> Окна (не свети!)</span>
+                <div className="mt-4 pt-3 border-t border-[#252d28] text-xs font-mono text-[#9ca59e] flex flex-wrap gap-x-3.5 gap-y-1">
+                  <span><strong className="text-[#38bdf8]">■</strong> Окна</span>
+                  <span><strong className="text-[#647a6e]">■</strong> Станки</span>
+                  <span><strong className="text-[#0ea5e9]">■</strong> Щиток</span>
+                  <span><strong className="text-[#facc15]">■</strong> Ключ</span>
                   <span><strong className="text-[#eab308]">■</strong> Замок</span>
                   <span><strong className="text-[#f97316]">■</strong> Цепь</span>
-                  <span><strong className="text-[#a78bfa]">■</strong> Люк</span>
+                  <span><strong className="text-[#a78bfa]">■</strong> Люк (2+ ур.)</span>
                   <span><strong className="text-[#4ade80]">■</strong> Прибор</span>
                 </div>
 

@@ -363,7 +363,7 @@ export function calculatePayout(
 }
 
 /**
- * Stealth helper: checks if line between (x1,y1) and (x2,y2) is unobstructed by walls ('#', 'W', 'L', 'C', 'V')
+ * Stealth helper: checks if line between (x1,y1) and (x2,y2) is unobstructed by walls ('#', 'W', 'P', closed 'L'/'C'/'V')
  */
 export function hasLineOfSight(
   grid: string[],
@@ -386,7 +386,7 @@ export function hasLineOfSight(
       return false;
     }
     const ch = grid[gy][gx];
-    if (ch === '#' || ch === 'W') return false;
+    if (ch === '#' || ch === 'W' || ch === 'P') return false;
     if ((ch === 'L' || ch === 'C' || ch === 'V') && !openedTiles.has(`${gx},${gy}`)) {
       return false;
     }
@@ -421,14 +421,13 @@ export function computeWindowFlashlightAlertRate(
     if (gy < 0 || gy >= grid.length || gx < 0 || gx >= grid[0].length) break;
     const ch = grid[gy][gx];
     if (ch === 'W') {
-      // Closer beam to window causes faster запал
       const proximityFactor = 1.45 - dist / (maxBeam * 1.4);
       return {
         alertPerSec: Math.max(14, 34 * proximityFactor) * windowAlertMultiplier,
         windowTile: { x: gx, y: gy },
       };
     }
-    if (ch === '#') break;
+    if (ch === '#' || ch === 'P') break;
   }
 
   // Also check if player stands right beside a window with flashlight turned ON
@@ -452,6 +451,91 @@ export function computeWindowFlashlightAlertRate(
   }
 
   return { alertPerSec: 0, windowTile: null };
+}
+
+/**
+ * Validates that a facility blueprint has uniform row lengths, reachable S -> T -> E
+ * without requiring optional wrench vents ('V'), and valid non-wall guard spawns/waypoints.
+ */
+export function validateFacilityLayout(facility: FacilityDef): string[] {
+  const errors: string[] = [];
+  const rows = facility.mapRows.length;
+  const cols = facility.mapRows[0]?.length ?? 0;
+
+  let spawn: [number, number] | null = null;
+  let exit: [number, number] | null = null;
+  let target: [number, number] | null = null;
+
+  for (let y = 0; y < rows; y++) {
+    if (facility.mapRows[y].length !== cols) {
+      errors.push(
+        `${facility.id} row ${y} length ${facility.mapRows[y].length} !== ${cols}`
+      );
+    }
+    for (let x = 0; x < facility.mapRows[y].length; x++) {
+      const ch = facility.mapRows[y][x];
+      if (ch === 'S') spawn = [x, y];
+      if (ch === 'E') exit = [x, y];
+      if (ch === 'T') target = [x, y];
+    }
+  }
+
+  if (!spawn) errors.push(`${facility.id} missing spawn S`);
+  if (!exit) errors.push(`${facility.id} missing exit E`);
+  if (!target) errors.push(`${facility.id} missing target T`);
+
+  // Check guard positions & waypoints aren't inside solid walls/machinery
+  const isBlockedForGuard = (gx: number, gy: number) => {
+    const x = Math.floor(gx);
+    const y = Math.floor(gy);
+    if (y < 0 || y >= rows || x < 0 || x >= cols) return true;
+    const ch = facility.mapRows[y][x];
+    return ch === '#' || ch === 'W' || ch === 'P';
+  };
+
+  for (const g of facility.guards) {
+    if (isBlockedForGuard(g.x, g.y)) {
+      errors.push(`${facility.id} guard ${g.id} spawns inside blocked tile (${g.x},${g.y})`);
+    }
+    for (const wp of g.waypoints) {
+      if (isBlockedForGuard(wp.x, wp.y)) {
+        errors.push(`${facility.id} guard ${g.id} waypoint inside blocked tile (${wp.x},${wp.y})`);
+      }
+    }
+  }
+
+  // BFS reachability from S to T and E WITHOUT using wrench-only 'V' vents
+  if (spawn && exit && target) {
+    const visited = new Set<string>();
+    const queue: [number, number][] = [spawn];
+    visited.add(`${spawn[0]},${spawn[1]}`);
+    while (queue.length > 0) {
+      const [cx, cy] = queue.shift()!;
+      for (const [dx, dy] of [
+        [1, 0],
+        [-1, 0],
+        [0, 1],
+        [0, -1],
+      ]) {
+        const nx = cx + dx;
+        const ny = cy + dy;
+        const key = `${nx},${ny}`;
+        if (nx < 0 || nx >= cols || ny < 0 || ny >= rows || visited.has(key)) continue;
+        const ch = facility.mapRows[ny][nx];
+        if (ch === '#' || ch === 'W' || ch === 'P' || ch === 'V') continue;
+        visited.add(key);
+        queue.push([nx, ny]);
+      }
+    }
+    if (!visited.has(`${target[0]},${target[1]}`)) {
+      errors.push(`${facility.id} target T unreachable without wrench V`);
+    }
+    if (!visited.has(`${exit[0]},${exit[1]}`)) {
+      errors.push(`${facility.id} exit E unreachable`);
+    }
+  }
+
+  return errors;
 }
 
 /**

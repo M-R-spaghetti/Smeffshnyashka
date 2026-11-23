@@ -7,6 +7,8 @@ import {
   VolumeX,
   LogOut,
   Hand,
+  KeyRound,
+  ZapOff,
 } from 'lucide-react';
 import { SOVIET_DEVICES } from '../game/data';
 import {
@@ -60,6 +62,8 @@ interface HudSnapshot {
   timeLeft: number;
   flashlightOn: boolean;
   hasDevice: boolean;
+  hasLevelKey: boolean;
+  powerOffTimer: number;
   beerTimer: number;
   warningText: string;
   interactLabel: string | null;
@@ -96,7 +100,6 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
   });
   callbacksRef.current = { onDrinkBeer, onExtracted, onEscapedEmpty, onBusted };
 
-  // Imperative action triggers from HUD buttons into the Canvas simulation
   const actionsRef = useRef({
     toggleFlashlight: false,
     triggerBeer: false,
@@ -109,6 +112,8 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
     timeLeft: facility.timeLimitSec,
     flashlightOn: false,
     hasDevice: false,
+    hasLevelKey: false,
+    powerOffTimer: 0,
     beerTimer: 0,
     warningText: '',
     interactLabel: null,
@@ -131,7 +136,6 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
     const rows = grid.length;
     const cols = grid[0].length;
 
-    // Locate spawn S, target T, exit E
     let startX = 2.5;
     let startY = 2.5;
     let exitX = 1.5;
@@ -155,14 +159,18 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
       }
     }
 
-    // Core simulation mutable state (zero React reconciliation per frame!)
     const sim = {
       px: startX,
       py: startY,
-      facing: 0, // facing right (open corridor)
-      flashlightOn: false, // starts OFF so player safely survives idle seconds even near windows!
+      camX: 0,
+      camY: 0,
+      facing: 0,
+      flashlightOn: false,
       hasDevice: false,
+      hasLevelKey: false,
+      collectedKeys: new Set<string>(),
       openedTiles: new Set<string>(),
+      powerOffTimer: 0,
       alert: 0,
       alertPeak: 0,
       timeLeft: facility.timeLimitSec,
@@ -177,7 +185,7 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
       interactTarget: null as {
         tx: number;
         ty: number;
-        kind: 'L' | 'C' | 'V' | 'T';
+        kind: 'L' | 'C' | 'V' | 'T' | 'D' | 'K';
         label: string;
         duration: number;
         blockedMsg?: string;
@@ -206,15 +214,15 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
 
     const rings: NoiseRing[] = [];
 
-    // Zero-GC pooled particle ring buffer (48 particles)
-    const POOL_SIZE = 48;
+    // Zero-GC pooled particle ring buffer
+    const POOL_SIZE = 56;
     const partActive = new Uint8Array(POOL_SIZE);
     const partX = new Float32Array(POOL_SIZE);
     const partY = new Float32Array(POOL_SIZE);
     const partVx = new Float32Array(POOL_SIZE);
     const partVy = new Float32Array(POOL_SIZE);
     const partLife = new Float32Array(POOL_SIZE);
-    const partHue = new Uint8Array(POOL_SIZE); // 0=amber, 1=green, 2=red
+    const partHue = new Uint8Array(POOL_SIZE); // 0=amber, 1=green, 2=red, 3=cyan
     let partCursor = 0;
 
     const spawnParticles = (wx: number, wy: number, count: number, hueCode: number) => {
@@ -222,35 +230,34 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
         const idx = partCursor;
         partCursor = (partCursor + 1) % POOL_SIZE;
         const ang = Math.random() * Math.PI * 2;
-        const spd = 0.8 + Math.random() * 2.2;
+        const spd = 0.8 + Math.random() * 2.4;
         partActive[idx] = 1;
         partX[idx] = wx;
         partY[idx] = wy;
         partVx[idx] = Math.cos(ang) * spd;
         partVy[idx] = Math.sin(ang) * spd;
-        partLife[idx] = 0.3 + Math.random() * 0.25;
+        partLife[idx] = 0.28 + Math.random() * 0.28;
         partHue[idx] = hueCode;
       }
     };
 
     const emitNoise = (x: number, y: number, radius: number, color = '#eab308') => {
       rings.push({ x, y, radius: 0.2, maxRadius: radius, alpha: 0.85, color });
-      // Alert nearby investigators
       for (const g of guards) {
         if (g.archetype === 'camera') continue;
         const d = Math.hypot(g.x - x, g.y - y);
-        const hearMult = g.archetype === 'investigator' ? 1.4 : 0.9;
+        const hearMult = g.archetype === 'investigator' ? 1.45 : 0.95;
         if (d <= radius * hearMult) {
           g.state = 'investigate';
           g.investigateX = x;
           g.investigateY = y;
-          g.investigateTimer = 4.2;
+          g.investigateTimer = 4.6;
           g.alertCueTimer = 1.2;
         }
       }
     };
 
-    // Unified Input Hub (held + edge triggers, cleared on blur/visibilitychange)
+    // Unified Input Hub
     const keys = new Set<string>();
 
     const onKeyDown = (e: KeyboardEvent) => {
@@ -300,29 +307,214 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
     document.addEventListener('visibilitychange', clearInputs);
     canvas.addEventListener('mousemove', onMouseMove);
 
-    // Canvas resize via ResizeObserver
     let viewW = 1280;
     let viewH = 720;
-    let tileSize = 48;
-    let originX = 0;
-    let originY = 0;
+    let tileSize = 54;
+
+    const clampCamera = (cx: number, cy: number) => {
+      const worldW = cols * tileSize;
+      const worldH = rows * tileSize;
+      const marginX = 48;
+      const marginTop = 88;
+      const marginBottom = 88;
+
+      let outX = cx;
+      let outY = cy;
+
+      if (worldW + marginX * 2 <= viewW) {
+        outX = -(viewW - worldW) / 2;
+      } else {
+        outX = Math.max(-marginX, Math.min(worldW - viewW + marginX, cx));
+      }
+
+      if (worldH + marginTop + marginBottom <= viewH) {
+        outY = -(viewH - worldH) / 2;
+      } else {
+        outY = Math.max(-marginTop, Math.min(worldH - viewH + marginBottom, cy));
+      }
+
+      return { x: outX, y: outY };
+    };
+
+    // Cached static architectural minimap canvas (redrawn only on state change)
+    const mmCell = Math.min(6, Math.floor(196 / cols));
+    const mmW = cols * mmCell;
+    const mmH = rows * mmCell;
+    const minimapCanvas = document.createElement('canvas');
+    minimapCanvas.width = mmW;
+    minimapCanvas.height = mmH;
+    const minimapCtx = minimapCanvas.getContext('2d');
+    let minimapDirty = true;
+
+    // Cached static facility tilemap (floors, walls, P machinery, doors, stenciled room names)
+    const worldCanvas = document.createElement('canvas');
+    const worldCtx = worldCanvas.getContext('2d');
+    let worldDirty = true;
+    let lastPowerOffVisual = false;
+
+    const rebuildMinimap = () => {
+      if (!minimapCtx) return;
+      for (let y = 0; y < rows; y++) {
+        for (let x = 0; x < cols; x++) {
+          const ch = grid[y][x];
+          const open = sim.openedTiles.has(`${x},${y}`);
+          if (ch === '#') minimapCtx.fillStyle = '#334039';
+          else if (ch === 'W') minimapCtx.fillStyle = '#38bdf8';
+          else if (ch === 'P') minimapCtx.fillStyle = '#475569';
+          else if (ch === 'D') minimapCtx.fillStyle = '#0ea5e9';
+          else if (ch === 'K' && !sim.collectedKeys.has(`${x},${y}`))
+            minimapCtx.fillStyle = '#facc15';
+          else if (ch === 'L' && !open) minimapCtx.fillStyle = '#eab308';
+          else if (ch === 'C' && !open) minimapCtx.fillStyle = '#f97316';
+          else if (ch === 'V' && !open) minimapCtx.fillStyle = '#a78bfa';
+          else if (ch === 'E') minimapCtx.fillStyle = '#22c55e';
+          else if (ch === 'T' && !sim.hasDevice) minimapCtx.fillStyle = '#4ade80';
+          else minimapCtx.fillStyle = '#151b18';
+          minimapCtx.fillRect(x * mmCell, y * mmCell, mmCell, mmCell);
+        }
+      }
+      minimapDirty = false;
+    };
+
+    const rebuildWorld = () => {
+      if (!worldCtx) return;
+      const wW = cols * tileSize;
+      const wH = rows * tileSize;
+      if (worldCanvas.width !== wW || worldCanvas.height !== wH) {
+        worldCanvas.width = wW;
+        worldCanvas.height = wH;
+      }
+      const offNow = sim.powerOffTimer > 0;
+      lastPowerOffVisual = offNow;
+
+      for (let y = 0; y < rows; y++) {
+        for (let x = 0; x < cols; x++) {
+          const ch = grid[y][x];
+          const px = x * tileSize;
+          const py = y * tileSize;
+          const opened = sim.openedTiles.has(`${x},${y}`);
+
+          worldCtx.fillStyle = (x + y) % 2 === 0 ? '#141917' : '#121715';
+          worldCtx.fillRect(px, py, tileSize, tileSize);
+
+          if (ch === '#') {
+            worldCtx.fillStyle = '#252e29';
+            worldCtx.fillRect(px, py, tileSize, tileSize);
+            worldCtx.strokeStyle = '#334039';
+            worldCtx.lineWidth = 1;
+            worldCtx.strokeRect(px + 0.5, py + 0.5, tileSize - 1, tileSize - 1);
+          } else if (ch === 'W') {
+            worldCtx.fillStyle = '#1a3546';
+            worldCtx.fillRect(px, py, tileSize, tileSize);
+            worldCtx.strokeStyle = '#38bdf8';
+            worldCtx.lineWidth = 2.5;
+            worldCtx.strokeRect(px + 2, py + 2, tileSize - 4, tileSize - 4);
+            worldCtx.beginPath();
+            worldCtx.moveTo(px + tileSize / 2, py + 2);
+            worldCtx.lineTo(px + tileSize / 2, py + tileSize - 2);
+            worldCtx.stroke();
+          } else if (ch === 'P') {
+            worldCtx.fillStyle = '#2c3631';
+            worldCtx.fillRect(px + 3, py + 3, tileSize - 6, tileSize - 6);
+            worldCtx.strokeStyle = '#4c5e54';
+            worldCtx.lineWidth = 2;
+            worldCtx.strokeRect(px + 3, py + 3, tileSize - 6, tileSize - 6);
+            worldCtx.fillStyle = '#1b221e';
+            worldCtx.fillRect(px + 8, py + 9, tileSize - 16, 6);
+            worldCtx.fillRect(px + 8, py + 19, tileSize - 16, 6);
+            worldCtx.fillStyle = (x + y) % 2 === 0 ? '#eab308' : '#4ade80';
+            worldCtx.fillRect(px + tileSize - 14, py + tileSize - 14, 5, 5);
+          } else if (ch === 'G') {
+            worldCtx.strokeStyle = '#94a3b8';
+            worldCtx.lineWidth = 1.5;
+            worldCtx.beginPath();
+            worldCtx.moveTo(px + 10, py + 14);
+            worldCtx.lineTo(px + 22, py + 10);
+            worldCtx.lineTo(px + 17, py + 24);
+            worldCtx.closePath();
+            worldCtx.moveTo(px + tileSize - 16, py + tileSize - 18);
+            worldCtx.lineTo(px + tileSize - 7, py + tileSize - 11);
+            worldCtx.lineTo(px + tileSize - 20, py + tileSize - 7);
+            worldCtx.closePath();
+            worldCtx.stroke();
+          } else if (ch === 'D') {
+            worldCtx.fillStyle = offNow ? '#1e293b' : '#163340';
+            worldCtx.fillRect(px + 5, py + 5, tileSize - 10, tileSize - 10);
+            worldCtx.strokeStyle = offNow ? '#64748b' : '#38bdf8';
+            worldCtx.lineWidth = 2.2;
+            worldCtx.strokeRect(px + 5, py + 5, tileSize - 10, tileSize - 10);
+            worldCtx.fillStyle = offNow ? '#94a3b8' : '#38bdf8';
+            worldCtx.font = `700 ${Math.max(10, Math.floor(tileSize * 0.24))}px JetBrains Mono, monospace`;
+            worldCtx.textAlign = 'center';
+            worldCtx.textBaseline = 'middle';
+            worldCtx.fillText(offNow ? 'ОТКЛ' : 'ЩИТ', px + tileSize / 2, py + tileSize / 2);
+          } else if (ch === 'L' && !opened) {
+            worldCtx.fillStyle = '#5c4813';
+            worldCtx.fillRect(px + 2, py + 2, tileSize - 4, tileSize - 4);
+            worldCtx.strokeStyle = '#eab308';
+            worldCtx.lineWidth = 2;
+            worldCtx.strokeRect(px + 3, py + 3, tileSize - 6, tileSize - 6);
+            worldCtx.fillStyle = '#eab308';
+            worldCtx.font = `700 ${Math.max(10, Math.floor(tileSize * 0.25))}px JetBrains Mono, monospace`;
+            worldCtx.textAlign = 'center';
+            worldCtx.textBaseline = 'middle';
+            worldCtx.fillText('ЗАМ', px + tileSize / 2, py + tileSize / 2);
+          } else if (ch === 'C' && !opened) {
+            worldCtx.fillStyle = '#572811';
+            worldCtx.fillRect(px + 2, py + 2, tileSize - 4, tileSize - 4);
+            worldCtx.strokeStyle = '#f97316';
+            worldCtx.lineWidth = 2.5;
+            worldCtx.beginPath();
+            worldCtx.moveTo(px + 5, py + 5);
+            worldCtx.lineTo(px + tileSize - 5, py + tileSize - 5);
+            worldCtx.moveTo(px + tileSize - 5, py + 5);
+            worldCtx.lineTo(px + 5, py + tileSize - 5);
+            worldCtx.stroke();
+          } else if (ch === 'V' && !opened) {
+            worldCtx.fillStyle = '#2d2347';
+            worldCtx.fillRect(px + 2, py + 2, tileSize - 4, tileSize - 4);
+            worldCtx.strokeStyle = '#a78bfa';
+            worldCtx.lineWidth = 2;
+            worldCtx.strokeRect(px + 4, py + 4, tileSize - 8, tileSize - 8);
+            worldCtx.fillStyle = '#c4b5fd';
+            worldCtx.font = `700 ${Math.max(9, Math.floor(tileSize * 0.24))}px JetBrains Mono, monospace`;
+            worldCtx.textAlign = 'center';
+            worldCtx.textBaseline = 'middle';
+            worldCtx.fillText('ЛЮК', px + tileSize / 2, py + tileSize / 2);
+          }
+        }
+      }
+
+      // Stenciled Soviet Room Labels baked onto concrete floor
+      worldCtx.fillStyle = 'rgba(236, 234, 225, 0.16)';
+      worldCtx.font = '700 12px JetBrains Mono, monospace';
+      worldCtx.textAlign = 'center';
+      worldCtx.textBaseline = 'middle';
+      for (const rm of facility.rooms) {
+        worldCtx.fillText(rm.label, rm.x * tileSize, rm.y * tileSize);
+      }
+
+      worldDirty = false;
+    };
 
     const updateLayout = () => {
       const rect = canvas.getBoundingClientRect();
-      const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+      const dpr = Math.min(window.devicePixelRatio || 1, 1.25);
       viewW = Math.max(320, rect.width);
       viewH = Math.max(320, rect.height);
       canvas.width = Math.floor(viewW * dpr);
       canvas.height = Math.floor(viewH * dpr);
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-      // Fit entire facility blueprint with breathing room for perimeter HUD
-      const usableW = viewW - 48;
-      const usableH = viewH - 148;
-      tileSize = Math.floor(Math.min(usableW / cols, usableH / rows));
-      tileSize = Math.max(22, Math.min(tileSize, 66));
-      originX = Math.floor((viewW - cols * tileSize) / 2);
-      originY = Math.floor((viewH - rows * tileSize) / 2 + 12);
+      // Spacious readable tile size for large multi-room exploration with follow camera
+      tileSize = viewW < 640 ? 44 : 56;
+      worldDirty = true;
+      const initialCam = clampCamera(
+        sim.px * tileSize - viewW / 2,
+        sim.py * tileSize - viewH / 2
+      );
+      sim.camX = initialCam.x;
+      sim.camY = initialCam.y;
     };
 
     updateLayout();
@@ -332,31 +524,46 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
     const isSolidTile = (gx: number, gy: number): boolean => {
       if (gy < 0 || gy >= rows || gx < 0 || gx >= cols) return true;
       const ch = grid[gy][gx];
-      if (ch === '#' || ch === 'W') return true;
+      if (ch === '#' || ch === 'W' || ch === 'P') return true;
       if ((ch === 'L' || ch === 'C' || ch === 'V') && !sim.openedTiles.has(`${gx},${gy}`)) {
         return true;
       }
       return false;
     };
 
-    const tryMove = (nx: number, ny: number, radius = 0.28): { x: number; y: number } => {
-      let rx = sim.px;
-      let ry = sim.py;
+    const isSolidForGuard = (gx: number, gy: number): boolean => {
+      if (gy < 0 || gy >= rows || gx < 0 || gx >= cols) return true;
+      const ch = grid[gy][gx];
+      if (ch === '#' || ch === 'W' || ch === 'P') return true;
+      if ((ch === 'L' || ch === 'C' || ch === 'V') && !sim.openedTiles.has(`${gx},${gy}`)) {
+        return true;
+      }
+      return false;
+    };
 
-      // X axis slide
+    const tryMoveEntity = (
+      curX: number,
+      curY: number,
+      nx: number,
+      ny: number,
+      radius = 0.28,
+      solidFn = isSolidTile
+    ): { x: number; y: number } => {
+      let rx = curX;
+      let ry = curY;
+
       const checkX =
-        !isSolidTile(Math.floor(nx - radius), Math.floor(ry - radius)) &&
-        !isSolidTile(Math.floor(nx + radius), Math.floor(ry - radius)) &&
-        !isSolidTile(Math.floor(nx - radius), Math.floor(ry + radius)) &&
-        !isSolidTile(Math.floor(nx + radius), Math.floor(ry + radius));
+        !solidFn(Math.floor(nx - radius), Math.floor(ry - radius)) &&
+        !solidFn(Math.floor(nx + radius), Math.floor(ry - radius)) &&
+        !solidFn(Math.floor(nx - radius), Math.floor(ry + radius)) &&
+        !solidFn(Math.floor(nx + radius), Math.floor(ry + radius));
       if (checkX) rx = nx;
 
-      // Y axis slide
       const checkY =
-        !isSolidTile(Math.floor(rx - radius), Math.floor(ny - radius)) &&
-        !isSolidTile(Math.floor(rx + radius), Math.floor(ny - radius)) &&
-        !isSolidTile(Math.floor(rx - radius), Math.floor(ny + radius)) &&
-        !isSolidTile(Math.floor(rx + radius), Math.floor(ny + radius));
+        !solidFn(Math.floor(rx - radius), Math.floor(ny - radius)) &&
+        !solidFn(Math.floor(rx + radius), Math.floor(ny - radius)) &&
+        !solidFn(Math.floor(rx - radius), Math.floor(ny + radius)) &&
+        !solidFn(Math.floor(rx + radius), Math.floor(ny + radius));
       if (checkY) ry = ny;
 
       return { x: rx, y: ry };
@@ -402,7 +609,6 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
       const rawDt = Math.min((now - lastTime) / 1000, 0.05);
       lastTime = now;
 
-      // Process imperative HUD button triggers
       if (actionsRef.current.toggleFlashlight) {
         actionsRef.current.toggleFlashlight = false;
         sim.flashlightOn = !sim.flashlightOn;
@@ -428,7 +634,6 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
       }
 
       if (!pausedRef.current && !sim.ended) {
-        // Decay shake & hitstop in real time
         sim.shakeTrauma = Math.max(0, sim.shakeTrauma - rawDt * 2.2);
         sim.alertSoundCooldown = Math.max(0, sim.alertSoundCooldown - rawDt);
 
@@ -439,6 +644,7 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
           sim.elapsed += dt;
           sim.timeLeft = Math.max(0, sim.timeLeft - dt);
           if (sim.beerTimer > 0) sim.beerTimer = Math.max(0, sim.beerTimer - dt);
+          if (sim.powerOffTimer > 0) sim.powerOffTimer = Math.max(0, sim.powerOffTimer - dt);
 
           const mods = computePlayerModifiers(saveRef.current, sim.beerTimer > 0);
 
@@ -448,7 +654,6 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
             );
           }
 
-          // Crisis countdown if alert reached 100%
           if (sim.crisisActive) {
             sim.crisisCountdown -= dt;
             if (sim.crisisCountdown <= 0) {
@@ -459,7 +664,7 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
             }
           }
 
-          // Player movement vector
+          // Player movement
           let mx = 0;
           let my = 0;
           if (keys.has('KeyW') || keys.has('ArrowUp')) my -= 1;
@@ -469,17 +674,18 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
 
           const moving = mx !== 0 || my !== 0;
           const sprinting = moving && (keys.has('ShiftLeft') || keys.has('ShiftRight'));
-          const baseSpeed = sim.hasDevice ? 2.15 * mods.haulSpeedMultiplier : 2.85;
+          const baseSpeed = sim.hasDevice ? 2.25 * mods.haulSpeedMultiplier : 3.05;
           const speed = sprinting ? baseSpeed * 1.48 : baseSpeed;
 
           if (moving) {
             const len = Math.hypot(mx, my);
             mx /= len;
             my /= len;
-            // Subtle comic wobble when beer is active
             const beerWobble =
-              sim.beerTimer > 0 ? Math.sin(sim.elapsed * 7) * 0.12 : 0;
-            const moved = tryMove(
+              sim.beerTimer > 0 ? Math.sin(sim.elapsed * 7) * 0.1 : 0;
+            const moved = tryMoveEntity(
+              sim.px,
+              sim.py,
               sim.px + (mx + beerWobble) * speed * dt,
               sim.py + my * speed * dt
             );
@@ -492,8 +698,7 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
               sim.facing = Math.atan2(my, mx);
             }
 
-            // Footstep cadence synced to distance traveled
-            const stepInterval = sprinting ? 0.58 : 0.82;
+            const stepInterval = sprinting ? 0.56 : 0.84;
             if (sim.stepDistAccum >= stepInterval) {
               sim.stepDistAccum = 0;
               const tile = grid[Math.floor(sim.py)]?.[Math.floor(sim.px)];
@@ -501,9 +706,9 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
               soundEngine.playFootstep(onGlass);
 
               const baseNoise = onGlass
-                ? 4.4
+                ? 4.6
                 : sprinting
-                  ? 3.4
+                  ? 3.6
                   : sim.hasDevice
                     ? 1.9
                     : 1.25;
@@ -524,20 +729,39 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
             }
           }
 
-          // Update flashlight facing toward cursor if cursor moved inside canvas
+          // Smooth damped camera tracking player + gentle lookahead
+          const lookAheadX = Math.cos(sim.facing) * (tileSize * 0.85);
+          const lookAheadY = Math.sin(sim.facing) * (tileSize * 0.85);
+          const targetCam = clampCamera(
+            sim.px * tileSize - viewW / 2 + lookAheadX,
+            sim.py * tileSize - viewH / 2 + lookAheadY
+          );
+          const damp = 1 - Math.exp(-7.5 * dt);
+          sim.camX += (targetCam.x - sim.camX) * damp;
+          sim.camY += (targetCam.y - sim.camY) * damp;
+
+          // Update flashlight aim using live world camera coordinates
           if (sim.mouseWorldActive) {
             const rect = canvas.getBoundingClientRect();
-            const worldMouseX = (sim.mouseClientX - rect.left - originX) / tileSize;
-            const worldMouseY = (sim.mouseClientY - rect.top - originY) / tileSize;
+            const worldMouseX = (sim.mouseClientX - rect.left + sim.camX) / tileSize;
+            const worldMouseY = (sim.mouseClientY - rect.top + sim.camY) / tileSize;
             sim.facing = Math.atan2(worldMouseY - sim.py, worldMouseX - sim.px);
           }
 
-          // Check nearby interactables (L, C, V, T)
-          sim.interactTarget = null;
+          // Auto-pickup master key K when stepping directly on it
           const ptx = Math.floor(sim.px);
           const pty = Math.floor(sim.py);
+          const underTile = grid[pty]?.[ptx];
+          if (underTile === 'K' && !sim.collectedKeys.has(`${ptx},${pty}`)) {
+            sim.collectedKeys.add(`${ptx},${pty}`);
+            sim.hasLevelKey = true;
+            minimapDirty = true;
+            soundEngine.playCashPayout();
+            spawnParticles(ptx + 0.5, pty + 0.5, 14, 0);
+          }
 
-          // Target device check
+          // Check nearby interactables (T, D, K, L, C, V)
+          sim.interactTarget = null;
           if (!sim.hasDevice && Math.hypot(sim.px - targetX, sim.py - targetY) < 1.25) {
             sim.interactTarget = {
               tx: Math.floor(targetX),
@@ -547,7 +771,6 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
               duration: facility.extractionTimeSec / mods.haulSpeedMultiplier,
             };
           } else {
-            // Check adjacent locked doors / chains / vents
             const dirs = [
               [0, 0],
               [1, 0],
@@ -560,53 +783,72 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
               const ny = pty + dy;
               if (ny < 0 || ny >= rows || nx < 0 || nx >= cols) continue;
               const ch = grid[ny][nx];
-              if (
-                (ch === 'L' || ch === 'C' || ch === 'V') &&
-                !sim.openedTiles.has(`${nx},${ny}`)
-              ) {
-                const dist = Math.hypot(nx + 0.5 - sim.px, ny + 0.5 - sim.py);
-                if (dist < 1.38) {
-                  if (ch === 'L') {
-                    sim.interactTarget = {
-                      tx: nx,
-                      ty: ny,
-                      kind: 'L',
-                      label: mods.hasInstantKeys
-                        ? 'Открыть ключом [E]'
-                        : 'Взломать замок [E]',
-                      duration: 2.2 / mods.lockpickSpeedMultiplier,
-                    };
-                  } else if (ch === 'C') {
-                    sim.interactTarget = {
-                      tx: nx,
-                      ty: ny,
-                      kind: 'C',
-                      label: mods.canCutChainFast
-                        ? 'Перекусить цепь болторезом [E]'
-                        : 'Спилить цепь вручную (шумно!) [E]',
-                      duration: 2.6 / mods.boltCutterSpeedMultiplier,
-                    };
-                  } else if (ch === 'V') {
-                    sim.interactTarget = {
-                      tx: nx,
-                      ty: ny,
-                      kind: 'V',
-                      label: mods.canBypassVent
-                        ? 'Открутить техлюк разводником [E]'
-                        : 'Техлюк закручен (нужен разводник)',
-                      duration: 1.0,
-                      blockedMsg: mods.canBypassVent
-                        ? undefined
-                        : 'Купи «Разводник» на барахолке, чтобы открывать техлюки!',
-                    };
-                  }
-                  break;
+              const keyStr = `${nx},${ny}`;
+              const dist = Math.hypot(nx + 0.5 - sim.px, ny + 0.5 - sim.py);
+              if (dist >= 1.4) continue;
+
+              if (ch === 'D' && sim.powerOffTimer <= 1) {
+                sim.interactTarget = {
+                  tx: nx,
+                  ty: ny,
+                  kind: 'D',
+                  label: 'Вырубить рубильник датчиков [E]',
+                  duration: 0.75,
+                };
+                break;
+              }
+              if (ch === 'K' && !sim.collectedKeys.has(keyStr)) {
+                sim.interactTarget = {
+                  tx: nx,
+                  ty: ny,
+                  kind: 'K',
+                  label: 'Взять ключ завхоза [E]',
+                  duration: 0.25,
+                };
+                break;
+              }
+              if ((ch === 'L' || ch === 'C' || ch === 'V') && !sim.openedTiles.has(keyStr)) {
+                if (ch === 'L') {
+                  const fastKey = mods.hasInstantKeys || sim.hasLevelKey;
+                  sim.interactTarget = {
+                    tx: nx,
+                    ty: ny,
+                    kind: 'L',
+                    label: fastKey
+                      ? 'Открыть дверь ключом [E]'
+                      : 'Взломать замок [E]',
+                    duration: fastKey ? 0.42 : 2.3 / mods.lockpickSpeedMultiplier,
+                  };
+                } else if (ch === 'C') {
+                  sim.interactTarget = {
+                    tx: nx,
+                    ty: ny,
+                    kind: 'C',
+                    label: mods.canCutChainFast
+                      ? 'Перекусить цепь болторезом [E]'
+                      : 'Спилить цепь вручную (шумно!) [E]',
+                    duration: 2.7 / mods.boltCutterSpeedMultiplier,
+                  };
+                } else if (ch === 'V') {
+                  sim.interactTarget = {
+                    tx: nx,
+                    ty: ny,
+                    kind: 'V',
+                    label: mods.canBypassVent
+                      ? 'Открутить вентлюк разводником [E]'
+                      : 'Техлюк (нужен разводник)',
+                    duration: 0.9,
+                    blockedMsg: mods.canBypassVent
+                      ? undefined
+                      : 'Секретный техлюк: купи «Разводник» на барахолке, чтобы резать путь!',
+                  };
                 }
+                break;
               }
             }
           }
 
-          // Handle holding E or Interact button
+          // Process holding E / Space / HUD button
           const holdingInteract =
             keys.has('KeyE') || keys.has('Space') || actionsRef.current.holdInteractBtn;
           if (sim.interactTarget && holdingInteract && !sim.interactTarget.blockedMsg) {
@@ -621,19 +863,47 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
                 4,
                 0
               );
-              // Cutting chains without boltcutter emits loud noise
               if (sim.interactTarget.kind === 'C' && !mods.canCutChainFast) {
-                emitNoise(sim.px, sim.py, 4.8 * mods.noiseMultiplier, '#ef4444');
+                emitNoise(sim.px, sim.py, 5.0 * mods.noiseMultiplier, '#ef4444');
               }
             }
             if (sim.interactProgress >= 1) {
-              if (sim.interactTarget.kind === 'T') {
+              const tKind = sim.interactTarget.kind;
+              if (tKind === 'T') {
                 sim.hasDevice = true;
+                minimapDirty = true;
                 soundEngine.playCashPayout();
                 sim.hitstop = 0.05;
-                spawnParticles(targetX, targetY, 16, 1);
+                spawnParticles(targetX, targetY, 18, 1);
+              } else if (tKind === 'D') {
+                sim.powerOffTimer = 16;
+                soundEngine.playDoorOpen();
+                sim.hitstop = 0.04;
+                sim.shakeTrauma = Math.min(1, sim.shakeTrauma + 0.25);
+                spawnParticles(
+                  sim.interactTarget.tx + 0.5,
+                  sim.interactTarget.ty + 0.5,
+                  14,
+                  3
+                );
+                emitNoise(sim.px, sim.py, 3.2 * mods.noiseMultiplier, '#38bdf8');
+              } else if (tKind === 'K') {
+                sim.collectedKeys.add(
+                  `${sim.interactTarget.tx},${sim.interactTarget.ty}`
+                );
+                sim.hasLevelKey = true;
+                minimapDirty = true;
+                soundEngine.playCashPayout();
+                spawnParticles(
+                  sim.interactTarget.tx + 0.5,
+                  sim.interactTarget.ty + 0.5,
+                  12,
+                  0
+                );
               } else {
                 sim.openedTiles.add(`${sim.interactTarget.tx},${sim.interactTarget.ty}`);
+                minimapDirty = true;
+                worldDirty = true;
                 soundEngine.playDoorOpen();
                 sim.hitstop = 0.04;
                 spawnParticles(
@@ -646,17 +916,17 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
               sim.interactProgress = 0;
             }
           } else {
-            sim.interactProgress = Math.max(0, sim.interactProgress - dt * 1.6);
+            sim.interactProgress = Math.max(0, sim.interactProgress - dt * 1.8);
           }
 
-          // Check extraction win at Exit E while carrying device
-          if (sim.hasDevice && Math.hypot(sim.px - exitX, sim.py - exitY) < 0.95) {
+          // Extraction win
+          if (sim.hasDevice && Math.hypot(sim.px - exitX, sim.py - exitY) < 0.98) {
             sim.ended = true;
             soundEngine.playCashPayout();
             callbacksRef.current.onExtracted();
           }
 
-          // Window Flashlight Запал Check!
+          // Window Flashlight Запал check
           let alertGainPerSec = 0;
           let activeWarning = '';
           const winCheck = computeWindowFlashlightAlertRate(
@@ -673,20 +943,23 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
             activeWarning = 'СВЕТИШЬ В ОКНО! ВЫКЛЮЧИ ФОНАРЬ [F]!';
           }
 
-          // Update 3 Guard/Camera Archetypes
+          // Update Guards & Cameras
           let spottedByGuard = false;
+          const camerasPoweredDown = sim.powerOffTimer > 0;
+
           for (const g of guards) {
             g.alertCueTimer = Math.max(0, g.alertCueTimer - dt);
 
             if (g.archetype === 'camera') {
-              const arc = g.sweepArc ?? 1.0;
-              const spd = g.sweepSpeed ?? 0.9;
-              g.angle = g.baseAngle + Math.sin(sim.elapsed * spd) * arc;
+              if (!camerasPoweredDown) {
+                const arc = g.sweepArc ?? 1.0;
+                const spd = g.sweepSpeed ?? 0.9;
+                g.angle = g.baseAngle + Math.sin(sim.elapsed * spd) * arc;
+              }
             } else {
-              // Patrol or Investigate target
               let tx = g.x;
               let ty = g.y;
-              if (g.state === 'investigate') {
+              if (g.state === 'investigate' || g.state === 'chase') {
                 tx = g.investigateX;
                 ty = g.investigateY;
                 g.investigateTimer -= dt;
@@ -697,7 +970,7 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
                 const wp = g.waypoints[g.waypointIdx % g.waypoints.length];
                 tx = wp.x;
                 ty = wp.y;
-                if (Math.hypot(tx - g.x, ty - g.y) < 0.25) {
+                if (Math.hypot(tx - g.x, ty - g.y) < 0.3) {
                   g.waypointIdx = (g.waypointIdx + 1) % g.waypoints.length;
                 }
               }
@@ -706,25 +979,39 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
               const dy = ty - g.y;
               const d = Math.hypot(dx, dy);
               if (d > 0.08) {
-                const moveSpd = g.state === 'investigate' ? g.speed * 1.15 : g.speed;
-                const nx = g.x + (dx / d) * moveSpd * dt;
-                const ny = g.y + (dy / d) * moveSpd * dt;
-                if (!isSolidTile(Math.floor(nx), Math.floor(ny))) {
-                  g.x = nx;
-                  g.y = ny;
-                } else if (g.state === 'investigate') {
+                const moveSpd =
+                  g.state === 'chase'
+                    ? g.speed * 1.25
+                    : g.state === 'investigate'
+                      ? g.speed * 1.12
+                      : g.speed;
+                const stepX = g.x + (dx / d) * moveSpd * dt;
+                const stepY = g.y + (dy / d) * moveSpd * dt;
+                const movedG = tryMoveEntity(
+                  g.x,
+                  g.y,
+                  stepX,
+                  stepY,
+                  0.24,
+                  isSolidForGuard
+                );
+                const movedDist = Math.hypot(movedG.x - g.x, movedG.y - g.y);
+                g.x = movedG.x;
+                g.y = movedG.y;
+                if (movedDist < 0.002 && g.state !== 'patrol') {
                   g.state = 'patrol';
                 }
                 const targetAngle = Math.atan2(dy, dx);
                 let diff = targetAngle - g.angle;
                 while (diff > Math.PI) diff -= Math.PI * 2;
                 while (diff < -Math.PI) diff += Math.PI * 2;
-                g.angle += diff * Math.min(1, dt * 6);
+                g.angle += diff * Math.min(1, dt * 6.5);
               }
             }
 
-            // Vision cone check
-            const effectiveRange = sim.flashlightOn ? g.visionRange * 1.18 : g.visionRange;
+            if (g.archetype === 'camera' && camerasPoweredDown) continue;
+
+            const effectiveRange = sim.flashlightOn ? g.visionRange * 1.2 : g.visionRange;
             const sees = isPointInVisionCone(
               g.x,
               g.y,
@@ -739,22 +1026,21 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
 
             if (sees) {
               spottedByGuard = true;
-              g.alertCueTimer = 0.6;
-              alertGainPerSec += g.archetype === 'camera' ? 42 : 52;
+              g.alertCueTimer = 0.7;
+              alertGainPerSec += g.archetype === 'camera' ? 44 : 54;
               activeWarning =
                 g.archetype === 'camera'
-                  ? 'ПОПАЛ В ДАТЧИК ОБЪЁМА!'
-                  : 'ТЕБЯ ВИДИТ ОХРАНА!';
+                  ? 'ПОПАЛ В ДАТЧИК ОБЪЁМА! (ВЫРУБИ ЩИТОК)'
+                  : 'ТЕБЯ ВИДИТ ОХРАНА! ПРЯЧЬСЯ ЗА СТАНКИ!';
 
               if (g.archetype !== 'camera') {
-                g.state = 'investigate';
+                g.state = sim.alert > 45 ? 'chase' : 'investigate';
                 g.investigateX = sim.px;
                 g.investigateY = sim.py;
-                g.investigateTimer = 4.5;
+                g.investigateTimer = 5.0;
               }
 
-              // Direct physical grab by guard!
-              if (g.archetype !== 'camera' && Math.hypot(g.x - sim.px, g.y - sim.py) < 0.72) {
+              if (g.archetype !== 'camera' && Math.hypot(g.x - sim.px, g.y - sim.py) < 0.74) {
                 triggerBusted(
                   'Сторож ЧОП схватил тебя прямо в коридоре. Весь инструмент и касса изъяты!'
                 );
@@ -770,8 +1056,7 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
               sim.alertSoundCooldown = 0.45;
             }
           } else if (!sim.crisisActive) {
-            // Cool down запал smoothly when hidden & quiet
-            sim.alert = Math.max(0, sim.alert - 11 * dt);
+            sim.alert = Math.max(0, sim.alert - 10.5 * dt);
           }
 
           sim.warningText =
@@ -779,7 +1064,6 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
             sim.interactTarget?.blockedMsg ||
             (sim.hasDevice ? 'Прибор у тебя! Тащи его к зелёному выходу (ЛАЗ)!' : '');
 
-          // Trigger Crisis at 100% запал!
           if (sim.alert >= 100 && !sim.crisisActive && !sim.ended) {
             sim.crisisActive = true;
             sim.crisisCountdown = 4.5;
@@ -790,7 +1074,6 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
             soundEngine.playBustedSiren();
           }
 
-          // Update noise rings
           for (let i = rings.length - 1; i >= 0; i--) {
             const r = rings[i];
             r.radius += dt * 5.2;
@@ -798,7 +1081,6 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
             if (r.radius >= r.maxRadius) rings.splice(i, 1);
           }
 
-          // Update pooled particles in-place
           for (let i = 0; i < POOL_SIZE; i++) {
             if (!partActive[i]) continue;
             partLife[i] -= dt;
@@ -812,154 +1094,130 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
             partVy[i] *= 0.92;
           }
 
-          // Update alert bar width directly via ref (no 60Hz React re-renders!)
           if (alertBarRef.current) {
             alertBarRef.current.style.transform = `scaleX(${Math.max(0, Math.min(1, sim.alert / 100))})`;
           }
 
-          // Throttled HUD sync (~8 Hz)
           sim.hudSyncAccum += dt;
-          if (sim.hudSyncAccum >= 0.12) {
+          if (sim.hudSyncAccum >= 0.16) {
             sim.hudSyncAccum = 0;
-            setHud({
+            const nextHud: HudSnapshot = {
               alert: Math.round(sim.alert),
               timeLeft: Math.ceil(sim.timeLeft),
               flashlightOn: sim.flashlightOn,
               hasDevice: sim.hasDevice,
-              beerTimer: sim.beerTimer,
+              hasLevelKey: sim.hasLevelKey,
+              powerOffTimer: Math.ceil(sim.powerOffTimer),
+              beerTimer: Math.ceil(sim.beerTimer),
               warningText: sim.warningText,
               interactLabel: sim.interactTarget?.label ?? null,
-              interactProgress: sim.interactProgress,
+              interactProgress: Math.round(sim.interactProgress * 20) / 20,
               crisisActive: sim.crisisActive,
-              crisisCountdown: Math.max(0, sim.crisisCountdown),
+              crisisCountdown: Math.max(0, Math.round(sim.crisisCountdown * 10) / 10),
               crisisReason: sim.crisisReason,
-            });
+            };
+            setHud((prev) =>
+              prev.alert === nextHud.alert &&
+              prev.timeLeft === nextHud.timeLeft &&
+              prev.flashlightOn === nextHud.flashlightOn &&
+              prev.hasDevice === nextHud.hasDevice &&
+              prev.hasLevelKey === nextHud.hasLevelKey &&
+              prev.powerOffTimer === nextHud.powerOffTimer &&
+              prev.beerTimer === nextHud.beerTimer &&
+              prev.warningText === nextHud.warningText &&
+              prev.interactLabel === nextHud.interactLabel &&
+              prev.interactProgress === nextHud.interactProgress &&
+              prev.crisisActive === nextHud.crisisActive &&
+              prev.crisisCountdown === nextHud.crisisCountdown
+                ? prev
+                : nextHud
+            );
           }
         }
       }
 
-      // === RENDER CANVAS 2D SCENE ===
+      // === RENDER CANVAS 2D SCENE WITH SMOOTH FOLLOW CAMERA ===
       ctx.save();
-      ctx.fillStyle = '#0b0e0d';
+      ctx.fillStyle = '#090c0b';
       ctx.fillRect(0, 0, viewW, viewH);
 
-      // Camera trauma shake
+      let shakeX = 0;
+      let shakeY = 0;
       if (sim.shakeTrauma > 0) {
         const mag = sim.shakeTrauma * sim.shakeTrauma * 9;
-        ctx.translate((Math.random() * 2 - 1) * mag, (Math.random() * 2 - 1) * mag);
+        shakeX = (Math.random() * 2 - 1) * mag;
+        shakeY = (Math.random() * 2 - 1) * mag;
       }
 
-      // Draw facility tiles
+      const ox = -Math.round(sim.camX) + shakeX;
+      const oy = -Math.round(sim.camY) + shakeY;
+
+      if (worldDirty || (sim.powerOffTimer > 0) !== lastPowerOffVisual) {
+        rebuildWorld();
+      }
+      ctx.drawImage(worldCanvas, ox, oy);
+
+      // Dynamic tile overlays only (glaring window, bobbing K key, pulsing E exit)
+      if (sim.windowGlareTile) {
+        const px = ox + sim.windowGlareTile.x * tileSize;
+        const py = oy + sim.windowGlareTile.y * tileSize;
+        ctx.fillStyle = '#ef4444';
+        ctx.fillRect(px, py, tileSize, tileSize);
+        ctx.strokeStyle = '#fecaca';
+        ctx.lineWidth = 2.5;
+        ctx.strokeRect(px + 2, py + 2, tileSize - 4, tileSize - 4);
+      }
+
+      // Draw pulsing exit LАЗ
+      {
+        const ex = ox + Math.floor(exitX) * tileSize;
+        const ey = oy + Math.floor(exitY) * tileSize;
+        const pulse = sim.hasDevice ? 0.58 + Math.sin(sim.elapsed * 6) * 0.25 : 0.34;
+        ctx.fillStyle = `rgba(34, 197, 94, ${pulse})`;
+        ctx.fillRect(ex + 2, ey + 2, tileSize - 4, tileSize - 4);
+        ctx.strokeStyle = '#4ade80';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(ex + 3, ey + 3, tileSize - 6, tileSize - 6);
+        ctx.fillStyle = '#ecfdf5';
+        ctx.font = `700 ${Math.max(10, Math.floor(tileSize * 0.26))}px JetBrains Mono, monospace`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('ЛАЗ', ex + tileSize / 2, ey + tileSize / 2);
+      }
+
+      // Draw any uncollected K master keys
       for (let y = 0; y < rows; y++) {
         for (let x = 0; x < cols; x++) {
-          const ch = grid[y][x];
-          const px = originX + x * tileSize;
-          const py = originY + y * tileSize;
-          const opened = sim.openedTiles.has(`${x},${y}`);
-
-          // Base concrete floor
-          ctx.fillStyle = (x + y) % 2 === 0 ? '#151a18' : '#131816';
-          ctx.fillRect(px, py, tileSize, tileSize);
-
-          if (ch === '#') {
-            ctx.fillStyle = '#262e2a';
-            ctx.fillRect(px, py, tileSize, tileSize);
-            ctx.strokeStyle = '#343f3a';
-            ctx.lineWidth = 1;
-            ctx.strokeRect(px + 0.5, py + 0.5, tileSize - 1, tileSize - 1);
-          } else if (ch === 'W') {
-            // Exterior Soviet window frame!
-            const glaring =
-              sim.windowGlareTile &&
-              sim.windowGlareTile.x === x &&
-              sim.windowGlareTile.y === y;
-            ctx.fillStyle = glaring ? '#ef4444' : '#1e3a4c';
-            ctx.fillRect(px, py, tileSize, tileSize);
-            ctx.strokeStyle = glaring ? '#fecaca' : '#38bdf8';
-            ctx.lineWidth = 2.5;
-            ctx.strokeRect(px + 2, py + 2, tileSize - 4, tileSize - 4);
-            // Cross muntin bars
-            ctx.beginPath();
-            ctx.moveTo(px + tileSize / 2, py + 2);
-            ctx.lineTo(px + tileSize / 2, py + tileSize - 2);
-            ctx.stroke();
-          } else if (ch === 'G') {
-            // Broken glass shards on concrete floor
-            ctx.strokeStyle = '#94a3b8';
-            ctx.lineWidth = 1.4;
-            ctx.beginPath();
-            ctx.moveTo(px + 8, py + 12);
-            ctx.lineTo(px + 18, py + 9);
-            ctx.lineTo(px + 14, py + 20);
-            ctx.closePath();
-            ctx.moveTo(px + tileSize - 14, py + tileSize - 16);
-            ctx.lineTo(px + tileSize - 6, py + tileSize - 10);
-            ctx.lineTo(px + tileSize - 18, py + tileSize - 6);
-            ctx.closePath();
-            ctx.stroke();
-          } else if (ch === 'L' && !opened) {
-            ctx.fillStyle = '#5c4813';
-            ctx.fillRect(px + 2, py + 2, tileSize - 4, tileSize - 4);
-            ctx.strokeStyle = '#eab308';
+          if (grid[y][x] === 'K' && !sim.collectedKeys.has(`${x},${y}`)) {
+            const px = ox + x * tileSize;
+            const py = oy + y * tileSize;
+            const bob = Math.sin(sim.elapsed * 4) * 2.5;
+            ctx.strokeStyle = 'rgba(234, 179, 8, 0.55)';
             ctx.lineWidth = 2;
-            ctx.strokeRect(px + 3, py + 3, tileSize - 6, tileSize - 6);
-            ctx.fillStyle = '#eab308';
-            ctx.font = `700 ${Math.max(10, Math.floor(tileSize * 0.28))}px JetBrains Mono, monospace`;
+            ctx.beginPath();
+            ctx.arc(px + tileSize / 2, py + tileSize / 2, tileSize * 0.34, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.fillStyle = '#facc15';
+            ctx.font = `700 ${Math.max(10, Math.floor(tileSize * 0.24))}px JetBrains Mono, monospace`;
             ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
-            ctx.fillText('ЗАМ', px + tileSize / 2, py + tileSize / 2);
-          } else if (ch === 'C' && !opened) {
-            ctx.fillStyle = '#572811';
-            ctx.fillRect(px + 2, py + 2, tileSize - 4, tileSize - 4);
-            ctx.strokeStyle = '#f97316';
-            ctx.lineWidth = 2.5;
-            ctx.beginPath();
-            ctx.moveTo(px + 4, py + 4);
-            ctx.lineTo(px + tileSize - 4, py + tileSize - 4);
-            ctx.moveTo(px + tileSize - 4, py + 4);
-            ctx.lineTo(px + 4, py + tileSize - 4);
-            ctx.stroke();
-          } else if (ch === 'V' && !opened) {
-            ctx.fillStyle = '#2d2347';
-            ctx.fillRect(px + 2, py + 2, tileSize - 4, tileSize - 4);
-            ctx.strokeStyle = '#a78bfa';
-            ctx.lineWidth = 2;
-            ctx.strokeRect(px + 4, py + 4, tileSize - 8, tileSize - 8);
-            ctx.fillStyle = '#c4b5fd';
-            ctx.font = `700 ${Math.max(9, Math.floor(tileSize * 0.26))}px JetBrains Mono, monospace`;
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText('ЛЮК', px + tileSize / 2, py + tileSize / 2);
-          } else if (ch === 'E') {
-            // Extraction hatch
-            const pulse = sim.hasDevice ? 0.55 + Math.sin(sim.elapsed * 6) * 0.25 : 0.3;
-            ctx.fillStyle = `rgba(34, 197, 94, ${pulse})`;
-            ctx.fillRect(px + 2, py + 2, tileSize - 4, tileSize - 4);
-            ctx.strokeStyle = '#4ade80';
-            ctx.lineWidth = 2;
-            ctx.strokeRect(px + 3, py + 3, tileSize - 6, tileSize - 6);
-            ctx.fillStyle = '#ecfdf5';
-            ctx.font = `700 ${Math.max(10, Math.floor(tileSize * 0.28))}px JetBrains Mono, monospace`;
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText('ЛАЗ', px + tileSize / 2, py + tileSize / 2);
+            ctx.fillText('КЛЧ', px + tileSize / 2, py + tileSize / 2 + bob);
           }
         }
       }
 
-      // Draw Target Soviet Instrument (if not yet picked up)
+      // Target Soviet Instrument
       if (!sim.hasDevice) {
-        const tx = originX + targetX * tileSize;
-        const ty = originY + targetY * tileSize;
+        const tx = ox + targetX * tileSize;
+        const ty = oy + targetY * tileSize;
         const pulseR = tileSize * (0.44 + Math.sin(sim.elapsed * 4.5) * 0.06);
 
-        ctx.strokeStyle = 'rgba(74, 222, 128, 0.55)';
+        ctx.strokeStyle = 'rgba(74, 222, 128, 0.6)';
         ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.arc(tx, ty, pulseR, 0, Math.PI * 2);
         ctx.stroke();
 
-        // Soviet Oscilloscope green chassis icon
         const boxW = tileSize * 0.68;
         const boxH = tileSize * 0.48;
         ctx.fillStyle = '#334139';
@@ -967,12 +1225,11 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
         ctx.lineWidth = 2;
         ctx.fillRect(tx - boxW / 2, ty - boxH / 2, boxW, boxH);
         ctx.strokeRect(tx - boxW / 2, ty - boxH / 2, boxW, boxH);
-        // Phosphor CRT screen
         ctx.fillStyle = '#4ade80';
         ctx.fillRect(tx - boxW * 0.34, ty - boxH * 0.28, boxW * 0.36, boxH * 0.56);
       }
 
-      // Helper: raycast wall-occluded visibility cone polygon so beams never bleed through walls
+      // Wall & Machinery-occluded Raycasted Light Cone helper
       const drawOccludedCone = (
         srcX: number,
         srcY: number,
@@ -981,11 +1238,11 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
         maxDist: number,
         fillStyle: string | CanvasGradient
       ) => {
-        const rays = 24;
-        const stepSize = 0.14;
+        const rays = 16;
+        const stepSize = 0.18;
         ctx.fillStyle = fillStyle;
         ctx.beginPath();
-        ctx.moveTo(originX + srcX * tileSize, originY + srcY * tileSize);
+        ctx.moveTo(ox + srcX * tileSize, oy + srcY * tileSize);
         for (let i = 0; i <= rays; i++) {
           const ang = centerAngle - halfAngle + (i / rays) * (halfAngle * 2);
           const cosA = Math.cos(ang);
@@ -1000,99 +1257,104 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
             }
           }
           ctx.lineTo(
-            originX + (srcX + cosA * hitDist) * tileSize,
-            originY + (srcY + sinA * hitDist) * tileSize
+            ox + (srcX + cosA * hitDist) * tileSize,
+            oy + (srcY + sinA * hitDist) * tileSize
           );
         }
         ctx.closePath();
         ctx.fill();
       };
 
-      // Draw Guard / Camera Vision Cones (wall-occluded!)
+      const camerasPoweredDown = sim.powerOffTimer > 0;
+
+      // Guard & Camera cones + sprites
       for (const g of guards) {
-        const gx = originX + g.x * tileSize;
-        const gy = originY + g.y * tileSize;
+        const gx = ox + g.x * tileSize;
+        const gy = oy + g.y * tileSize;
 
-        const coneColor =
-          g.alertCueTimer > 0
-            ? 'rgba(239, 68, 68, 0.34)'
-            : g.archetype === 'camera'
-              ? 'rgba(249, 115, 22, 0.24)'
-              : 'rgba(250, 204, 21, 0.22)';
+        if (!(g.archetype === 'camera' && camerasPoweredDown)) {
+          const coneColor =
+            g.alertCueTimer > 0
+              ? 'rgba(239, 68, 68, 0.36)'
+              : g.archetype === 'camera'
+                ? 'rgba(249, 115, 22, 0.25)'
+                : g.archetype === 'investigator'
+                  ? 'rgba(248, 113, 113, 0.22)'
+                  : 'rgba(250, 204, 21, 0.22)';
+          drawOccludedCone(g.x, g.y, g.angle, g.visionHalfAngle, g.visionRange, coneColor);
+        }
 
-        drawOccludedCone(g.x, g.y, g.angle, g.visionHalfAngle, g.visionRange, coneColor);
-
-        // Guard / Camera Actor Sprite
         ctx.save();
         ctx.translate(gx, gy);
         ctx.rotate(g.angle);
         if (g.archetype === 'camera') {
-          ctx.fillStyle = '#1e293b';
-          ctx.strokeStyle = '#f97316';
+          ctx.fillStyle = camerasPoweredDown ? '#0f172a' : '#1e293b';
+          ctx.strokeStyle = camerasPoweredDown ? '#475569' : '#f97316';
           ctx.lineWidth = 2;
           ctx.fillRect(-9, -7, 18, 14);
           ctx.strokeRect(-9, -7, 18, 14);
-          ctx.fillStyle = '#ef4444';
+          ctx.fillStyle = camerasPoweredDown ? '#334155' : '#ef4444';
           ctx.beginPath();
           ctx.arc(8, 0, 3, 0, Math.PI * 2);
           ctx.fill();
         } else {
-          // Guard shoulders & Soviet security cap
-          ctx.fillStyle = g.archetype === 'investigator' ? '#7f1d1d' : '#1e3a5f';
+          ctx.fillStyle = g.archetype === 'investigator' ? '#881c1c' : '#1e3a5f';
           ctx.strokeStyle = '#090b0a';
-          ctx.lineWidth = 2;
+          ctx.lineWidth = 2.2;
           ctx.beginPath();
           ctx.arc(0, 0, tileSize * 0.28, 0, Math.PI * 2);
           ctx.fill();
           ctx.stroke();
-          // Visor facing direction
           ctx.fillStyle = '#eab308';
           ctx.fillRect(tileSize * 0.14, -4, 6, 8);
         }
         ctx.restore();
 
-        // Alert Telegraph (! / ?)
-        if (g.alertCueTimer > 0 || g.state === 'investigate') {
-          ctx.fillStyle = g.alertCueTimer > 0 ? '#ef4444' : '#facc15';
+        if (g.alertCueTimer > 0 || g.state === 'investigate' || g.state === 'chase') {
+          ctx.fillStyle =
+            g.state === 'chase' || g.alertCueTimer > 0 ? '#ef4444' : '#facc15';
           ctx.font = '800 16px Unbounded, sans-serif';
           ctx.textAlign = 'center';
-          ctx.fillText(g.alertCueTimer > 0 ? '!' : '?', gx, gy - tileSize * 0.45);
+          ctx.fillText(
+            g.state === 'chase' || g.alertCueTimer > 0 ? '!' : '?',
+            gx,
+            gy - tileSize * 0.48
+          );
         }
       }
 
-      // Draw Player Flashlight Cone (wall-occluded!)
-      const pScreenX = originX + sim.px * tileSize;
-      const pScreenY = originY + sim.py * tileSize;
+      // Player Flashlight Cone
+      const pScreenX = ox + sim.px * tileSize;
+      const pScreenY = oy + sim.py * tileSize;
       if (sim.flashlightOn) {
         const hasRedFilter = getToolCount(saveRef.current, 'red_filter') > 0;
-        const beamR = tileSize * 4.5;
+        const beamR = tileSize * 4.8;
         const grad = ctx.createRadialGradient(pScreenX, pScreenY, 6, pScreenX, pScreenY, beamR);
         if (hasRedFilter) {
-          grad.addColorStop(0, 'rgba(239, 68, 68, 0.34)');
+          grad.addColorStop(0, 'rgba(239, 68, 68, 0.36)');
           grad.addColorStop(1, 'rgba(239, 68, 68, 0)');
         } else {
-          grad.addColorStop(0, 'rgba(254, 249, 195, 0.44)');
+          grad.addColorStop(0, 'rgba(254, 249, 195, 0.45)');
           grad.addColorStop(1, 'rgba(254, 249, 195, 0)');
         }
-        drawOccludedCone(sim.px, sim.py, sim.facing, 0.32, 4.5, grad);
+        drawOccludedCone(sim.px, sim.py, sim.facing, 0.33, 4.8, grad);
       }
 
-      // Draw Expanding Noise Rings
+      // Noise Rings
       for (const r of rings) {
         ctx.strokeStyle = r.color;
-        ctx.globalAlpha = r.alpha * 0.75;
+        ctx.globalAlpha = r.alpha * 0.78;
         ctx.lineWidth = 2;
         ctx.beginPath();
-        ctx.arc(originX + r.x * tileSize, originY + r.y * tileSize, r.radius * tileSize, 0, Math.PI * 2);
+        ctx.arc(ox + r.x * tileSize, oy + r.y * tileSize, r.radius * tileSize, 0, Math.PI * 2);
         ctx.stroke();
       }
       ctx.globalAlpha = 1;
 
-      // Draw Player Climber (Кавес / Окись / Урбаникс)
+      // Player Climber Sprite
       ctx.save();
       ctx.translate(pScreenX, pScreenY);
       ctx.rotate(sim.facing);
-      // Heavy stolen Soviet device strapped to back if carrying!
       if (sim.hasDevice) {
         ctx.fillStyle = '#15803d';
         ctx.strokeStyle = '#86efac';
@@ -1100,7 +1362,6 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
         ctx.fillRect(-tileSize * 0.38, -tileSize * 0.24, tileSize * 0.26, tileSize * 0.48);
         ctx.strokeRect(-tileSize * 0.38, -tileSize * 0.24, tileSize * 0.26, tileSize * 0.48);
       }
-      // Hooded climber silhouette
       ctx.fillStyle = '#eceae1';
       ctx.strokeStyle = '#0f1210';
       ctx.lineWidth = 2.5;
@@ -1108,21 +1369,20 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
       ctx.arc(0, 0, tileSize * 0.26, 0, Math.PI * 2);
       ctx.fill();
       ctx.stroke();
-      // Headlamp/direction dot
       ctx.fillStyle = sim.flashlightOn ? '#facc15' : '#4ade80';
       ctx.beginPath();
       ctx.arc(tileSize * 0.18, 0, 3.8, 0, Math.PI * 2);
       ctx.fill();
       ctx.restore();
 
-      // Diegetic interaction progress ring around target tile
+      // Diegetic interaction progress ring
       if (sim.interactTarget && sim.interactProgress > 0) {
-        const ix = originX + (sim.interactTarget.tx + 0.5) * tileSize;
-        const iy = originY + (sim.interactTarget.ty + 0.5) * tileSize;
+        const ix = ox + (sim.interactTarget.tx + 0.5) * tileSize;
+        const iy = oy + (sim.interactTarget.ty + 0.5) * tileSize;
         ctx.strokeStyle = '#0a0d0c';
         ctx.lineWidth = 6;
         ctx.beginPath();
-        ctx.arc(ix, iy, tileSize * 0.55, 0, Math.PI * 2);
+        ctx.arc(ix, iy, tileSize * 0.52, 0, Math.PI * 2);
         ctx.stroke();
 
         ctx.strokeStyle = '#eab308';
@@ -1131,43 +1391,70 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
         ctx.arc(
           ix,
           iy,
-          tileSize * 0.55,
+          tileSize * 0.52,
           -Math.PI / 2,
           -Math.PI / 2 + Math.PI * 2 * sim.interactProgress
         );
         ctx.stroke();
       }
 
-      // Draw Pooled Particles
+      // Pooled Particles
       for (let i = 0; i < POOL_SIZE; i++) {
         if (!partActive[i]) continue;
         ctx.fillStyle =
-          partHue[i] === 1 ? '#4ade80' : partHue[i] === 2 ? '#ef4444' : '#facc15';
+          partHue[i] === 1
+            ? '#4ade80'
+            : partHue[i] === 2
+              ? '#ef4444'
+              : partHue[i] === 3
+                ? '#38bdf8'
+                : '#facc15';
         ctx.globalAlpha = Math.min(1, partLife[i] * 2.5);
-        ctx.fillRect(
-          originX + partX[i] * tileSize - 2,
-          originY + partY[i] * tileSize - 2,
-          4,
-          4
-        );
+        ctx.fillRect(ox + partX[i] * tileSize - 2, oy + partY[i] * tileSize - 2, 4, 4);
       }
       ctx.globalAlpha = 1;
 
-      // Subtle critical peripheral red vignette when alert > 60%
+      // Critical alert peripheral red border glow
       if (sim.alert > 60) {
-        const vigAlpha = ((sim.alert - 60) / 40) * 0.35;
-        const vig = ctx.createRadialGradient(
-          viewW / 2,
-          viewH / 2,
-          viewW * 0.25,
-          viewW / 2,
-          viewH / 2,
-          viewW * 0.65
-        );
-        vig.addColorStop(0, 'rgba(239,68,68,0)');
-        vig.addColorStop(1, `rgba(239,68,68,${vigAlpha})`);
-        ctx.fillStyle = vig;
-        ctx.fillRect(0, 0, viewW, viewH);
+        const vigAlpha = ((sim.alert - 60) / 40) * 0.42;
+        ctx.strokeStyle = `rgba(239, 68, 68, ${vigAlpha})`;
+        ctx.lineWidth = 24;
+        ctx.strokeRect(0, 0, viewW, viewH);
+      }
+
+      // === ARCHITECTURAL BLUEPRINT MINIMAP (Bottom-Right Corner above bottom bar) ===
+      if (viewW >= 720) {
+        if (minimapDirty) rebuildMinimap();
+        const mmX = viewW - mmW - 22;
+        const mmY = viewH - mmH - 76;
+
+        ctx.fillStyle = 'rgba(12, 16, 14, 0.9)';
+        ctx.fillRect(mmX - 6, mmY - 6, mmW + 12, mmH + 12);
+        ctx.strokeStyle = '#303b35';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(mmX - 6, mmY - 6, mmW + 12, mmH + 12);
+
+        ctx.drawImage(minimapCanvas, mmX, mmY);
+
+        // Guard blips on minimap when within 8.5 tiles or alerted
+        for (const g of guards) {
+          const distToPlayer = Math.hypot(g.x - sim.px, g.y - sim.py);
+          if (distToPlayer <= 8.5 || g.state !== 'patrol') {
+            ctx.fillStyle = g.archetype === 'camera' ? '#f97316' : '#ef4444';
+            ctx.fillRect(
+              mmX + g.x * mmCell - 2,
+              mmY + g.y * mmCell - 2,
+              4,
+              4
+            );
+          }
+        }
+
+        // Player dot on minimap
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(mmX + sim.px * mmCell, mmY + sim.py * mmCell, 3, 0, Math.PI * 2);
+        ctx.fill();
       }
 
       ctx.restore();
@@ -1189,20 +1476,22 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
   }, [facility, device.code]);
 
   return (
-    <div className="relative w-full h-screen overflow-hidden bg-[#0b0e0d] select-none">
-      {/* Isolated Full-Bleed Canvas 2D Surface */}
+    <div className="relative w-full h-screen overflow-hidden bg-[#090c0b] select-none">
       <canvas
         ref={canvasRef}
         data-testid="stealth-raid-canvas"
         className="w-full h-full block"
       />
+      <div
+        aria-hidden="true"
+        className="pointer-events-none fixed inset-0 bg-[radial-gradient(circle_at_center,transparent_48%,rgba(4,7,6,0.52)_100%)]"
+      />
 
-      {/* Pointer-pass-through Perimeter HUD (NO backdrop-filter over canvas!) */}
+      {/* Pointer-pass-through Perimeter HUD */}
       <div className="fixed inset-0 pointer-events-none flex flex-col justify-between p-3 sm:p-5">
-        {/* Top Row: Left Alert/Objective Cluster · Right Timer & Utility Buttons */}
+        {/* Top Row: Left Alert/Objective · Center Safe Warning · Right Timer & Utility */}
         <div className="flex items-start justify-between gap-4">
-          {/* Left HUD Cluster: Запал Meter & Objective */}
-          <div className="pointer-events-auto bg-[#111513]/92 border border-[#2c3530] rounded-xl px-4 py-2.5 shadow-xl min-w-[240px] sm:min-w-[290px]">
+          <div className="pointer-events-auto bg-[#111513]/92 border border-[#2c3530] rounded-xl px-4 py-2.5 shadow-xl min-w-[245px] sm:min-w-[300px]">
             <div className="flex items-baseline justify-between gap-3">
               <span className="text-[11px] font-mono text-[#9ca59e]">
                 ЗАПАЛ · {facility.name}
@@ -1231,19 +1520,29 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
                 }}
               />
             </div>
-            <div className="mt-1.5 text-xs font-mono text-[#cfd5d0] flex items-center justify-between gap-2">
+            <div className="mt-1.5 text-xs font-mono text-[#cfd5d0] flex flex-wrap items-center gap-x-3 gap-y-0.5">
               <span>
                 {hud.hasDevice
                   ? `Несёшь ${device.code} -> к ЛАЗу`
                   : `Цель: вынести ${device.code}`}
               </span>
+              {hud.hasLevelKey && (
+                <span className="text-[#facc15] inline-flex items-center gap-1">
+                  <KeyRound className="w-3 h-3" /> Ключ
+                </span>
+              )}
+              {hud.powerOffTimer > 0 && (
+                <span className="text-[#38bdf8] inline-flex items-center gap-1">
+                  <ZapOff className="w-3 h-3" /> Датчики {Math.ceil(hud.powerOffTimer)}с
+                </span>
+              )}
               {hud.beerTimer > 0 && (
                 <span className="text-[#eab308]">Пиво {Math.ceil(hud.beerTimer)}с</span>
               )}
             </div>
           </div>
 
-          {/* Center Top Safe Warning Banner (keeps central playfield 100% unobstructed!) */}
+          {/* Center Top Safe Warning Banner */}
           <div className="hidden md:flex flex-1 justify-center px-2">
             {hud.warningText && !hud.crisisActive && (
               <div className="px-4 py-2 rounded-lg bg-[#1c1010]/95 border border-[#ef4444]/85 text-xs sm:text-sm font-mono font-bold text-[#fca5a5] shadow-lg text-center">
@@ -1252,7 +1551,6 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
             )}
           </div>
 
-          {/* Right HUD Cluster: Timer + Square Utility Icons */}
           <div className="pointer-events-auto flex items-center gap-2.5">
             <div className="bg-[#111513]/92 border border-[#2c3530] rounded-xl px-3.5 py-2 text-right">
               <div className="text-[10px] font-mono text-[#8d948e] leading-none">
@@ -1292,7 +1590,7 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
           </div>
         </div>
 
-        {/* Mobile-only top-edge warning banner */}
+        {/* Mobile-only top-edge warning */}
         <div className="md:hidden flex justify-center -mt-auto">
           {hud.warningText && !hud.crisisActive && (
             <div className="px-3 py-1 rounded-lg bg-[#1c1010]/95 border border-[#ef4444]/85 text-[11px] font-mono font-bold text-[#fca5a5]">
@@ -1303,7 +1601,6 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
 
         {/* Bottom Perimeter Controls Strip */}
         <div className="flex flex-wrap items-end justify-between gap-3">
-          {/* Interactive tool & action buttons */}
           <div className="pointer-events-auto flex flex-wrap items-center gap-2">
             <button
               type="button"
@@ -1371,10 +1668,9 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
             </button>
           </div>
 
-          {/* Escape Empty-Handed Panic Button */}
           <div className="pointer-events-auto flex items-center gap-3">
-            <span className="hidden md:inline text-xs font-mono text-[#88918a]">
-              WASD Ходьба · Shift Бег · Не свети в синие окна!
+            <span className="hidden lg:inline text-xs font-mono text-[#88918a]">
+              Прячься за станки · ЩИТ гасит датчики · Не свети в синие окна!
             </span>
             <button
               type="button"
@@ -1392,7 +1688,7 @@ export const StealthRaid: React.FC<StealthRaidProps> = ({
         </div>
       </div>
 
-      {/* ЗАПАЛ 100% CRISIS OVERLAY: Last chance to drop loot & run before getting BUSTED! */}
+      {/* ЗАПАЛ 100% CRISIS OVERLAY */}
       {hud.crisisActive && (
         <div
           className="fixed inset-0 z-40 flex items-center justify-center p-4 bg-[#1a0808]/82"

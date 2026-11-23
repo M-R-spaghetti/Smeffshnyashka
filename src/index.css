@@ -1,0 +1,80 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Unbounded", system-ui, sans-serif;
+  --font-sans: "Golos Text", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    font-family: var(--font-sans);
+    background-color: #0f1110;
+    color: #eceae1;
+  }
+
+  button:not(:disabled) {
+    cursor: pointer;
+  }
+
+  button:focus-visible,
+  a:focus-visible {
+    outline: 2px solid #eab308;
+    outline-offset: 2px;
+  }
+}
+
+.font-display {
+  font-family: var(--font-display);
+}
+
+.font-mono-num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.hud-stroke {
+  paint-order: stroke fill;
+  -webkit-text-stroke: 3px rgba(10, 12, 11, 0.9);
+  text-shadow: 0 2px 6px rgba(0, 0, 0, 0.85);
+}
+
+.industrial-grid {
+  background-image:
+    linear-gradient(to right, rgba(236, 234, 225, 0.035) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(236, 234, 225, 0.035) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+.pcb-pattern {
+  background-color: #163022;
+  background-image:
+    radial-gradient(rgba(74, 222, 128, 0.08) 1px, transparent 1px),
+    linear-gradient(to right, rgba(74, 222, 128, 0.04) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(74, 222, 128, 0.04) 1px, transparent 1px);
+  background-size: 16px 16px, 48px 48px, 48px 48px;
+}
+
+@keyframes pulse-border {
+  0%, 100% {
+    border-color: rgba(239, 68, 68, 0.45);
+  }
+  50% {
+    border-color: rgba(239, 68, 68, 0.95);
+  }
+}
+
+.animate-alert-border {
+  animation: pulse-border 0.8s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-alert-border {
+    animation: none;
+  }
+}

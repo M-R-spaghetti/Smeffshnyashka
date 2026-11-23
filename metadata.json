@@ -1,0 +1,6 @@
+{
+  "name": "ЗАЛАЗ: Драгметалл",
+  "description": "Стелс-симулятор советских залазов на НИИ, заводы и цехи: вынос приборов, разборка плат и скусывание советских радиодеталей с золотом, серебром и палладием.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
